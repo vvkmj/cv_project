@@ -1,4 +1,3 @@
-import numpy as np
 from typing import List, Dict, Any, Tuple
 import logging
 
@@ -40,7 +39,6 @@ class RiderAssociator:
 
         # Person center coordinates
         pcx = (px1 + px2) / 2.0
-        pcy = (py1 + py2) / 2.0
 
         # Motorcycle expanded horizontal boundaries (riders sit directly above/on motorcycle)
         h_leeway = mw * self.max_horizontal_leeway
@@ -54,7 +52,7 @@ class RiderAssociator:
         if py2 < (my1 - mh * self.max_vertical_gap):
             # Person is floating completely above motorcycle
             return False, 0.0
-        if py1 > (my1 + mh * 0.85):
+        if py1 + ph * 0.30 > my1 + mh * 0.32 or py2 > my2 + mh * 0.15:
             # Person is almost entirely below motorcycle's top section
             return False, 0.0
 
@@ -121,45 +119,33 @@ class RiderAssociator:
         motorcycles = [d for d in detections if d["object_class"] == "motorcycle"]
         persons = [d for d in detections if d["object_class"] == "person"]
 
-        # Track which person belongs to which motorcycle
-        associated_person_indices = set()
-
+        keys = ("x1", "y1", "x2", "y2")
+        bike_boxes = []
         for moto in motorcycles:
-            mb = moto["bounding_box"]
-            moto_box = [mb["x1"], mb["y1"], mb["x2"], mb["y2"]]
             moto["associated_riders"] = []
+            bike_boxes.append([moto["bounding_box"][key] for key in keys])
 
-            scored_candidates = []
-            for p_idx, person in enumerate(persons):
-                pb = person["bounding_box"]
-                person_box = [pb["x1"], pb["y1"], pb["x2"], pb["y2"]]
-                is_rider, score = self.is_person_riding_motorcycle(person_box, moto_box)
+        for person in persons:
+            box = person["bounding_box"]
+            person_box = [box[key] for key in keys]
+            head_box = dict(zip(keys, self.extract_head_region(person_box, image_shape)))
+            person["head_box"] = head_box
+            candidates = []
+            for index, bike_box in enumerate(bike_boxes):
+                is_rider, score = self.is_person_riding_motorcycle(person_box, bike_box)
                 if is_rider:
-                    scored_candidates.append((score, p_idx, person))
-
-            # Sort by highest association score
-            scored_candidates.sort(key=lambda x: x[0], reverse=True)
-
-            for score, p_idx, person in scored_candidates:
-                # Associate person
-                associated_person_indices.add(p_idx)
-                pb = person["bounding_box"]
-                person_box = [pb["x1"], pb["y1"], pb["x2"], pb["y2"]]
-                head_box = self.extract_head_region(person_box, image_shape)
-
-                rider_info = {
-                    "person_tracking_id": person.get("tracking_id"),
-                    "person_confidence": person.get("confidence", 0.0),
-                    "person_box": pb,
-                    "head_box": {
-                        "x1": head_box[0],
-                        "y1": head_box[1],
-                        "x2": head_box[2],
-                        "y2": head_box[3]
-                    },
-                    "association_score": round(score, 3)
-                }
-                moto["associated_riders"].append(rider_info)
+                    candidates.append((score, index))
+            candidates.sort(reverse=True)
+            if not candidates or (len(candidates) > 1 and candidates[0][0] - candidates[1][0] < 0.07):
+                continue
+            score, index = candidates[0]
+            motorcycles[index]["associated_riders"].append({
+                "person_tracking_id": person.get("tracking_id"),
+                "person_confidence": person["confidence"],
+                "person_box": box,
+                "head_box": head_box,
+                "association_score": round(score, 3),
+            })
 
         return motorcycles, persons
 

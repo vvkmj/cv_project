@@ -200,3 +200,26 @@ Updates direction angle, passenger limit, or rule toggles.
 #### `DELETE /api/cameras/{camera_id}`
 Removes camera configuration.
 
+## Hosted Traffic Review API
+
+The hosted endpoints below use Netlify Identity. Assign `traffic_ingest` to capture operators and `traffic_reviewer` to human reviewers. Requests accept an Identity bearer token; same-origin browser requests can use the Identity session. Reviewer roles are not granted on signup. All hosted incident and image responses use `Cache-Control: no-store`.
+
+| Method and route | Purpose |
+| --- | --- |
+| `GET /api/violations?review_status=pending&page=1&page_size=20` | Queue; also supports `camera_id`, `violation_type`, and `min_confidence`. |
+| `GET /api/violations/:id` | Source, video-relative timestamp, zero-based frame, rider and motorcycle IDs, confidence, evidence URLs, and review metadata. |
+| `GET /api/violations/:id/evidence/:variant` | Private full-resolution JPEG (`original`, `crop`, or `annotated`). |
+| `PATCH /api/violations/:id/status` | Submit `review_status` and optional `review_note`. Server records the reviewer and time; a second decision returns `409`. |
+| `POST /api/violations/ingest` | Ingest role only. Multipart `metadata` JSON plus `original`, `crop`, and `annotated` JPEGs (5 MiB maximum each). Identical incident keys return the existing ID without overwriting evidence. |
+
+All incidents start `pending`. A reviewer can set `confirmed`, `false_positive`, or `rejected` (unclear evidence). Decisions do not delete or modify images. The worker derives its retry key from the recording digest, logical source, camera, rule and track ID; this does not deduplicate across distinct recordings or guarantee deduplication after track ID changes.
+
+Run capture from the repository root on a machine with the Python requirements and model checkpoints:
+
+```sh
+python -m backend.analyze_traffic sample_media/motorcycle_traffic_1.mp4 \
+  --site https://your-site.netlify.app --source "Recording 01" --camera CAM-01
+```
+
+The command prompts for an ingest account access token and submits evidence per incident. Python inference is not deployed on Netlify. The local demo remains separate; its unauthenticated endpoints and static media mounts must stay loopback-only. The hosted dashboard's legacy upload, camera, and telemetry routes are not provided by the review server.
+

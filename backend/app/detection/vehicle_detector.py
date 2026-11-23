@@ -25,7 +25,7 @@ class VehicleDetector:
         self,
         model_path: str = "yolov8n.pt",
         confidence_threshold: float = 0.35,
-        iou_threshold: float = 0.45,
+        iou_threshold: float = 0.55,
         device: Optional[str] = None
     ):
         self.model_path = model_path
@@ -66,12 +66,11 @@ class VehicleDetector:
         Returns a list of raw detection dictionaries conforming to the Detection contract.
         """
         if not self.is_loaded or self.model is None:
-            logger.debug("VehicleDetector: Model is not loaded.")
-            return []
+            raise RuntimeError("Vehicle detection model is unavailable")
 
         try:
             # Run inference targeting only classes of interest
-            results = self.model.predict(
+            options = dict(
                 source=image,
                 conf=self.confidence_threshold,
                 iou=self.iou_threshold,
@@ -79,6 +78,15 @@ class VehicleDetector:
                 classes=list(TARGET_CLASSES.keys()),
                 verbose=False
             )
+            try:
+                results = self.model.predict(**options)
+            except (RuntimeError, ValueError):
+                if self.device == "cpu":
+                    raise
+                logger.warning("Vehicle accelerator inference failed; retrying on CPU")
+                self.device = "cpu"
+                self.model.to("cpu")
+                results = self.model.predict(**{**options, "device": "cpu"})
 
             detections: List[Dict[str, Any]] = []
             if not results or len(results) == 0:
@@ -87,10 +95,8 @@ class VehicleDetector:
             result = results[0]
             boxes = result.boxes
 
-            for box in boxes:
-                cls_id = int(box.cls[0].item())
-                conf = float(box.conf[0].item())
-                xyxy = box.xyxy[0].cpu().numpy().tolist()
+            for *xyxy, conf, class_id in boxes.data.cpu().tolist():
+                cls_id = int(class_id)
 
                 cls_name = TARGET_CLASSES.get(cls_id, result.names.get(cls_id, "unknown"))
 
@@ -110,14 +116,14 @@ class VehicleDetector:
                 })
 
             return detections
-        except Exception as e:
-            logger.error(f"Error during detection on frame {frame_number}: {e}", exc_info=True)
-            return []
+        except Exception:
+            logger.exception("Vehicle inference failed at frame %s", frame_number)
+            raise RuntimeError("Vehicle inference failed") from None
 
     def get_status(self) -> Dict[str, Any]:
         return {
             "name": "Vehicle & Person Detector",
-            "model_path": self.model_path,
+            "model_path": os.path.basename(self.model_path),
             "version": self.model_version,
             "is_loaded": self.is_loaded,
             "device": self.device,

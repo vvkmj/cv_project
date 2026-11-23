@@ -20,7 +20,7 @@ class Settings(BaseModel):
     
     # Default Thresholds
     DETECTION_CONFIDENCE: float = float(os.getenv("DETECTION_CONFIDENCE", "0.35"))
-    HELMET_CONFIDENCE: float = float(os.getenv("HELMET_CONFIDENCE", "0.65"))
+    HELMET_CONFIDENCE: float = float(os.getenv("HELMET_CONFIDENCE", "0.50"))
     DEFAULT_PASSENGER_LIMIT: int = int(os.getenv("DEFAULT_PASSENGER_LIMIT", "2"))
 
 settings = Settings()

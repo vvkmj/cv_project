@@ -33,16 +33,16 @@ class EvidenceGenerator:
     def __init__(
         self,
         base_dir: str = "evidence",
-        original_dir: str = "evidence/original",
-        annotated_dir: str = "evidence/annotated",
-        crop_dir: str = "evidence/crops",
-        video_dir: str = "evidence/videos"
+        original_dir: Optional[str] = None,
+        annotated_dir: Optional[str] = None,
+        crop_dir: Optional[str] = None,
+        video_dir: Optional[str] = None
     ):
         self.base_dir = base_dir
-        self.original_dir = original_dir
-        self.annotated_dir = annotated_dir
-        self.crop_dir = crop_dir
-        self.video_dir = video_dir
+        self.original_dir = original_dir or os.path.join(base_dir, "original")
+        self.annotated_dir = annotated_dir or os.path.join(base_dir, "annotated")
+        self.crop_dir = crop_dir or os.path.join(base_dir, "crops")
+        self.video_dir = video_dir or os.path.join(base_dir, "videos")
 
         for d in [self.original_dir, self.annotated_dir, self.crop_dir, self.video_dir]:
             os.makedirs(d, exist_ok=True)
@@ -90,7 +90,7 @@ class EvidenceGenerator:
             t_id = viol.get("tracking_id", "N/A")
             v_color = VIOLATION_COLORS.get(v_type, (0, 0, 255))
 
-            v_title = f"VIOLATION: {v_type.replace('_', ' ').upper()} (Track #{t_id})"
+            v_title = f"POTENTIAL: {v_type.replace('_', ' ').upper()} (Track #{t_id})"
             cv2.rectangle(annotated, (15, banner_y - 20), (min(w - 15, 450), banner_y + 8), v_color, -1)
             cv2.putText(annotated, v_title, (22, banner_y - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
             banner_y += 36
@@ -116,13 +116,7 @@ class EvidenceGenerator:
         annot_full = os.path.join(self.annotated_dir, annot_filename)
         crop_full = os.path.join(self.crop_dir, crop_filename)
 
-        # Save original frame
-        cv2.imwrite(orig_full, original_frame)
-
-        # Save annotated keyframe
-        cv2.imwrite(annot_full, annotated_frame)
-
-        # Extract and save crop
+        crop = original_frame
         if crop_box:
             h, w = original_frame.shape[:2]
             cx1 = max(0, int(crop_box["x1"]))
@@ -130,12 +124,22 @@ class EvidenceGenerator:
             cx2 = min(w, int(crop_box["x2"]))
             cy2 = min(h, int(crop_box["y2"]))
             crop = original_frame[cy1:cy2, cx1:cx2]
-            if crop.size > 0:
-                cv2.imwrite(crop_full, crop)
-            else:
-                cv2.imwrite(crop_full, annotated_frame)
-        else:
-            cv2.imwrite(crop_full, annotated_frame)
+            if crop.size == 0:
+                raise ValueError("Evidence crop does not intersect the original frame")
+
+        created = []
+        try:
+            for path, image in ((orig_full, original_frame), (annot_full, annotated_frame), (crop_full, crop)):
+                success, buffer = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 98])
+                if not success:
+                    raise RuntimeError("Could not encode incident evidence")
+                with open(path, "xb") as output:
+                    created.append(path)
+                    output.write(buffer)
+        except Exception:
+            for path in created:
+                os.unlink(path)
+            raise
 
         return {
             "evidence_path": orig_full,

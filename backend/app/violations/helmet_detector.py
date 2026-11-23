@@ -1,189 +1,122 @@
-import os
 import logging
-from typing import Dict, Any, Optional, Tuple
+import os
+from pathlib import Path
+
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
-class HelmetDetector:
-    """
-    Dedicated Helmet Detection & Classification Module.
-    Evaluates extracted rider head regions.
-    Supports classes: 'helmet', 'no_helmet', 'unknown'.
-    Strictly reports unavailability if dedicated weights are not present.
-    """
+LABELS = {
+    "helmet": "helmet", "with_helmet": "helmet", "hardhat": "helmet", "hard_hat": "helmet",
+    "no_helmet": "no_helmet", "without_helmet": "no_helmet", "no_hat": "no_helmet",
+}
 
-    def __init__(
-        self,
-        weights_path: str = "ml/weights/helmet_yolov8.pt",
-        confidence_threshold: float = 0.50,
-        device: Optional[str] = None
-    ):
+
+def head_match(candidate, head):
+    x1, y1, x2, y2 = candidate
+    left, top, right, bottom = (head[key] for key in ("x1", "y1", "x2", "y2"))
+    center_x, center_y = (x1 + x2) / 2, (y1 + y2) / 2
+    if not (left < center_x < right and top < center_y < bottom and x2 > x1 and y2 > y1):
+        return 0.0
+    containment = (max(0, min(x2, right) - max(x1, left)) * max(0, min(y2, bottom) - max(y1, top)))
+    containment /= (x2 - x1) * (y2 - y1)
+    if containment < 0.55:
+        return 0.0
+    centrality = 1 - abs(2 * center_x - left - right) / (right - left)
+    return 0.75 * containment + 0.25 * centrality
+
+
+class HelmetDetector:
+    def __init__(self, weights_path="ml/weights/helmet_yolov8.pt", confidence_threshold=0.50, device=None):
         self.weights_path = weights_path
         self.confidence_threshold = confidence_threshold
         self.device = device or "cpu"
         self.model = None
         self.is_available = False
-        self.model_version = "None"
-        self.status_message = ""
-        self._load_model()
-
-    def _load_model(self):
-        if not os.path.exists(self.weights_path):
-            self.is_available = False
-            self.model = None
-            self.model_version = "Unavailable (No Weights)"
-            self.status_message = (
-                f"Dedicated helmet detection weights '{self.weights_path}' not found. "
-                "Helmet analysis is currently DISABLED. Place trained YOLO weights in ml/weights/ "
-                "or run python ml/training/train_helmet.py to enable."
-            )
-            logger.info(self.status_message)
+        self.model_version = "Unavailable (No Weights)"
+        self.status_message = "Dedicated helmet detection weights not found. Helmet analysis is disabled."
+        if not Path(weights_path).is_file():
             return
-
         try:
             from ultralytics import YOLO
-            self.model = YOLO(self.weights_path)
+
+            model = YOLO(weights_path)
+            labels = {self.normalize(name) for name in model.names.values()}
+            if model.task != "detect" or not {"helmet", "no_helmet"} <= {LABELS.get(label) for label in labels}:
+                raise ValueError("Helmet weights must detect both helmet and no-helmet boxes")
+            self.model = model
             self.is_available = True
-            self.model_version = f"YOLOv8-Helmet-{os.path.basename(self.weights_path)}"
+            self.model_version = f"YOLOv8-Helmet-{Path(weights_path).name}"
             self.status_message = "Helmet model loaded and operational."
-            logger.info(f"Loaded dedicated helmet model from {self.weights_path}")
-        except Exception as e:
-            self.is_available = False
-            self.model = None
+        except Exception:
             self.model_version = "Error Loading Weights"
-            self.status_message = f"Failed to load helmet model from {self.weights_path}: {e}"
-            logger.error(self.status_message)
+            self.status_message = "Helmet weights could not be loaded or lack the required detection classes."
+            logger.exception("Helmet model initialization failed")
 
-    def analyze_head_region(
-        self,
-        full_image: np.ndarray,
-        head_box: Dict[str, float]
-    ) -> Dict[str, Any]:
-        """
-        Analyzes the rider head region.
-        Returns:
-            status: 'helmet' | 'no_helmet' | 'unknown'
-            confidence: float (0.0 to 1.0)
-            explanation: str
-        """
-        if not self.is_available or self.model is None:
-            return {
-                "status": "unknown",
-                "confidence": 0.0,
-                "explanation": self.status_message,
-                "is_available": False
-            }
+    @staticmethod
+    def normalize(label):
+        return label.lower().strip().replace(" ", "_").replace("-", "_")
 
-        hx1 = max(0, int(head_box["x1"]))
-        hy1 = max(0, int(head_box["y1"]))
-        hx2 = min(full_image.shape[1], int(head_box["x2"]))
-        hy2 = min(full_image.shape[0], int(head_box["y2"]))
+    def analyze_head_region(self, full_image, head_box):
+        return self.analyze_heads(full_image, [head_box], [head_box])[0]
 
-        if (hx2 - hx1) < 10 or (hy2 - hy1) < 10:
-            return {
-                "status": "unknown",
-                "confidence": 0.0,
-                "explanation": "Head region too small or occluded for reliable helmet verification.",
-                "is_available": True
-            }
+    def analyze_heads(self, image, heads, visible_heads):
+        unknown = self.result("unknown", 0.0, self.status_message if not self.is_available else "Head status unclear.")
+        output = [unknown.copy() for _ in heads]
+        if not self.is_available or not heads:
+            return output
+        height, width = image.shape[:2]
+        samples = []
+        for index, head in enumerate(heads):
+            left, top, right, bottom = (int(head[key]) for key in ("x1", "y1", "x2", "y2"))
+            left, top, right, bottom = max(0, left), max(0, top), min(width, right), min(height, bottom)
+            if right - left < 10 or bottom - top < 10:
+                continue
+            pad_x, pad_y = int((right - left) * 0.15), int((bottom - top) * 0.20)
+            x_origin, y_origin = max(0, left - pad_x), max(0, top - pad_y)
+            crop = image[y_origin:min(height, bottom + pad_y), x_origin:min(width, right + pad_x)]
+            samples.append((index, x_origin, y_origin, crop))
 
-        # Slightly expand crop boundary to provide context for headgear/hair detection
-        pad_x = int((hx2 - hx1) * 0.20)
-        pad_y = int((hy2 - hy1) * 0.20)
-        cx1 = max(0, hx1 - pad_x)
-        cy1 = max(0, hy1 - pad_y)
-        cx2 = min(full_image.shape[1], hx2 + pad_x)
-        cy2 = min(full_image.shape[0], hy2 + pad_y)
+        for offset in range(0, len(samples), 8):
+            batch = samples[offset:offset + 8]
+            options = dict(source=[sample[3] for sample in batch], imgsz=224, conf=0.20, iou=0.50,
+                           device=self.device, verbose=False, max_det=12)
+            try:
+                results = self.model.predict(**options)
+            except (RuntimeError, ValueError):
+                if self.device == "cpu":
+                    raise
+                logger.warning("Helmet accelerator inference failed; retrying on CPU")
+                self.device = "cpu"
+                self.model.to("cpu")
+                results = self.model.predict(**{**options, "device": "cpu"})
+            for (index, left, top, _), result in zip(batch, results, strict=True):
+                scores = {}
+                head = heads[index]
+                for row in result.boxes.data.cpu().tolist():
+                    x1, y1, x2, y2, confidence, class_id = row
+                    status = LABELS.get(self.normalize(result.names[int(class_id)]))
+                    if status is None:
+                        continue
+                    candidate = (x1 + left, y1 + top, x2 + left, y2 + top)
+                    ownership = head_match(candidate, head)
+                    if not ownership or any(
+                        other is not head and head_match(candidate, other) >= ownership - 0.10
+                        for other in visible_heads
+                    ):
+                        continue
+                    scores[status] = max(confidence, scores.get(status, 0.0))
+                if scores:
+                    status, confidence = max(scores.items(), key=lambda entry: entry[1])
+                    runner_up = max((score for label, score in scores.items() if label != status), default=0.0)
+                    if confidence >= self.confidence_threshold and confidence - runner_up >= 0.15:
+                        output[index] = self.result(status, confidence, "Spatially matched head detection.")
+        return output
 
-        crop = full_image[cy1:cy2, cx1:cx2]
-        if crop.size == 0:
-            return {
-                "status": "unknown",
-                "confidence": 0.0,
-                "explanation": "Empty crop for head region.",
-                "is_available": True
-            }
+    def result(self, status, confidence, explanation):
+        return dict(status=status, confidence=confidence, explanation=explanation, is_available=self.is_available)
 
-        try:
-            results = self.model.predict(
-                source=crop,
-                imgsz=224,
-                conf=0.20,
-                device=self.device,
-                verbose=False
-            )
-
-            if not results or len(results) == 0 or len(results[0].boxes) == 0:
-                return {
-                    "status": "unknown",
-                    "confidence": 0.0,
-                    "explanation": "No helmet or head features detected in crop with sufficient confidence.",
-                    "is_available": True
-                }
-
-            boxes = results[0].boxes
-            best_conf = 0.0
-            best_status = "unknown"
-
-            # Check detected classes
-            # Expected custom classes: 0: 'helmet', 1: 'no_helmet' (or names from model)
-            names = results[0].names
-            for box in boxes:
-                cls_id = int(box.cls[0].item())
-                conf = float(box.conf[0].item())
-                label = names.get(cls_id, "").lower()
-                norm_label = label.replace(" ", "_").replace("-", "_")
-
-                if any(k in norm_label for k in ["without_helmet", "no_helmet", "without", "no_hat"]):
-                    if conf > best_conf:
-                        best_conf = conf
-                        best_status = "no_helmet"
-                elif any(k in norm_label for k in ["with_helmet", "helmet", "hardhat", "hard_hat"]):
-                    if conf > best_conf:
-                        best_conf = conf
-                        best_status = "helmet"
-
-            if best_conf < self.confidence_threshold:
-                return {
-                    "status": "unknown",
-                    "confidence": round(best_conf, 3),
-                    "explanation": f"Helmet classification confidence ({best_conf:.2f}) below threshold ({self.confidence_threshold:.2f}). Marked as unknown.",
-                    "is_available": True
-                }
-
-            explanation = (
-                f"Rider head evaluated: {best_status.replace('_', ' ').title()} "
-                f"with confidence {best_conf:.2f}."
-            )
-            return {
-                "status": best_status,
-                "confidence": round(best_conf, 3),
-                "explanation": explanation,
-                "is_available": True
-            }
-
-        except Exception as e:
-            logger.error(f"Error in helmet inference on crop: {e}")
-            return {
-                "status": "unknown",
-                "confidence": 0.0,
-                "explanation": f"Inference error during helmet analysis: {e}",
-                "is_available": True
-            }
-
-    def get_status(self) -> Dict[str, Any]:
-        return {
-            "name": "Dedicated Helmet Detector",
-            "weights_path": self.weights_path,
-            "version": self.model_version,
-            "is_available": self.is_available,
-            "device": self.device,
-            "confidence_threshold": self.confidence_threshold,
-            "status_message": self.status_message,
-            "guidance": (
-                "To enable automated no-helmet violations, provide custom YOLOv8 weights trained "
-                "on a helmet dataset (e.g. Roboflow/Kaggle Helmet Dataset) saved to ml/weights/helmet_yolov8.pt."
-            )
-        }
-
+    def get_status(self):
+        return dict(name="Dedicated Helmet Detector", weights_path=os.path.basename(self.weights_path),
+                    version=self.model_version, is_available=self.is_available, device=self.device,
+                    status_message=self.status_message, confidence_threshold=self.confidence_threshold)

@@ -1,4 +1,5 @@
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 from typing import List, Dict, Any, Tuple, Optional
 import logging
 
@@ -52,6 +53,7 @@ class Track:
         self.history.append(
             (detection["frame_number"], detection["timestamp"], cx, cy, list(self.bbox))
         )
+        del self.history[:-32]
         self.hits += 1
         self.time_since_update = 0
         if self.hits >= 2:
@@ -63,6 +65,14 @@ class Track:
 
     def get_center(self) -> Tuple[float, float]:
         return (self.bbox[0] + self.bbox[2]) / 2.0, (self.bbox[1] + self.bbox[3]) / 2.0
+
+    def predicted_box(self, frame_number: int) -> List[float]:
+        if len(self.history) < 2:
+            return self.bbox
+        previous, current = self.history[-2:]
+        scale = min(3, max(0, frame_number - current[0])) / max(1, current[0] - previous[0])
+        dx, dy = (current[2] - previous[2]) * scale, (current[3] - previous[3]) * scale
+        return [self.bbox[0] + dx, self.bbox[1] + dy, self.bbox[2] + dx, self.bbox[3] + dy]
 
     def get_movement_vector(self, window: int = 6) -> Optional[Tuple[float, float, float]]:
         """
@@ -111,29 +121,28 @@ class MultiObjectTracker:
             # Build IoU cost matrix
             iou_matrix = np.zeros((len(self.tracks), len(detections)), dtype=np.float32)
             for t_idx, track in enumerate(self.tracks):
+                predicted = track.predicted_box(detections[0]["frame_number"])
                 for d_idx, det in enumerate(detections):
                     # Only match if object classes are compatible (e.g., both vehicle or same class)
                     if track.object_class == det["object_class"]:
                         bbox = det["bounding_box"]
                         det_box = [bbox["x1"], bbox["y1"], bbox["x2"], bbox["y2"]]
-                        iou_matrix[t_idx, d_idx] = calculate_iou(track.bbox, det_box)
+                        iou_matrix[t_idx, d_idx] = max(
+                            calculate_iou(predicted, det_box), 0.90 * calculate_iou(track.bbox, det_box)
+                        )
 
-            # Greedy bipartite matching
-            while True:
-                max_val = np.max(iou_matrix)
-                if max_val < self.iou_threshold:
-                    break
-                t_idx, d_idx = np.unravel_index(np.argmax(iou_matrix), iou_matrix.shape)
+            scores = np.where(iou_matrix >= self.iou_threshold, 1 + iou_matrix, 0)
+            track_indices, detection_indices = linear_sum_assignment(scores, maximize=True)
+            for t_idx, d_idx in zip(track_indices, detection_indices):
+                if not scores[t_idx, d_idx]:
+                    continue
                 matched_tracks.add(t_idx)
                 matched_dets.add(d_idx)
                 
                 # Update track with detection
                 self.tracks[t_idx].update(detections[d_idx])
+                self.tracks[t_idx].confirmed = self.tracks[t_idx].hits >= self.min_hits
                 detections[d_idx]["tracking_id"] = self.tracks[t_idx].track_id
-
-                # Invalidate row and column
-                iou_matrix[t_idx, :] = -1.0
-                iou_matrix[:, d_idx] = -1.0
 
         # Create new tracks for unmatched detections
         for d_idx, det in enumerate(detections):
@@ -141,6 +150,8 @@ class MultiObjectTracker:
                 new_track = Track(self.next_track_id, det)
                 self.next_track_id += 1
                 self.tracks.append(new_track)
+                new_track.confirmed = self.min_hits <= 1
+                matched_tracks.add(len(self.tracks) - 1)
                 det["tracking_id"] = new_track.track_id
 
         # Mark missed tracks and prune stale ones

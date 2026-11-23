@@ -1,0 +1,52 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pytest_cache/
+.pytest_cache/
+
+# Virtual Environments
+venv/
+env/
+.env
+
+# Model Checkpoints & Large Weights
+*.pth
+*.onnx
+# Track essential verified models
+!yolov8n.pt
+!ml/weights/helmet_yolov8.pt
+
+# Node / Frontend
+node_modules/
+frontend/dist/
+frontend/node_modules/
+npm-debug.log*
+
+# Databases & Runtime Output
+*.db
+*.sqlite3
+evidence/original/*
+evidence/annotated/*
+evidence/crops/*
+evidence/videos/*
+!evidence/original/.gitkeep
+!evidence/annotated/.gitkeep
+!evidence/crops/.gitkeep
+!evidence/videos/.gitkeep
+uploads/*
+!uploads/.gitkeep
+
+# Operating System
+.DS_Store
+Thumbs.db
+
+# External / Unrelated Scratch Files
+RPAChallenge*
+*aa_bot*
+*challenge*
+*invoices*
+*execution_report*
+*existing_bot*
+*rpa_*
+generate_deliverable_images.py

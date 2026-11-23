@@ -1,0 +1,23 @@
+# Ultralytics YOLOv8 Dataset Configuration: Motorcycle Helmet Detection
+# Dataset Root: ml/datasets/helmet_dataset
+path: ../datasets/helmet_dataset
+train: images/train
+val: images/val
+test: images/test
+
+# Classes:
+names:
+  0: helmet
+  1: no_helmet
+
+# Hyperparameters for Reproducible Training
+epochs: 50
+batch: 16
+imgsz: 640
+device: cpu # set to 'mps' for Apple Silicon or '0' for CUDA
+lr0: 0.01
+lrf: 0.01
+optimizer: AdamW
+patience: 15
+save_period: 5
+

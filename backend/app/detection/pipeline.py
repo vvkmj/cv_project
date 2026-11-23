@@ -2,6 +2,8 @@ import os
 import uuid
 import time
 import logging
+import math
+from contextlib import ExitStack
 from typing import Dict, Any, List, Optional, Callable
 import cv2
 import numpy as np
@@ -16,6 +18,32 @@ from backend.app.violations.evidence_generator import EvidenceGenerator
 
 logger = logging.getLogger(__name__)
 
+
+class HelmetObservations:
+    def __init__(self):
+        self.streaks = {}
+        self.reported = set()
+
+    def observe(self, rider_id, motorcycle_id, frame_number, timestamp, status):
+        if rider_id is None or motorcycle_id is None or rider_id in self.reported:
+            return False
+        previous = self.streaks.pop(rider_id, None)
+        if status != "no_helmet":
+            return False
+        count = 1
+        if previous and previous[0] == motorcycle_id and frame_number - previous[1] == 1 and timestamp - previous[2] <= 0.5:
+            count += previous[3]
+        if count >= 3:
+            self.reported.add(rider_id)
+            return True
+        self.streaks[rider_id] = (motorcycle_id, frame_number, timestamp, count)
+        return False
+
+    def prune(self, active_ids):
+        self.reported.intersection_update(active_ids)
+        self.streaks = {key: state for key, state in self.streaks.items() if key in active_ids}
+
+
 class TrafficAnalysisPipeline:
     """
     Unified Computer Vision Engine orchestrating detection, tracking,
@@ -28,7 +56,8 @@ class TrafficAnalysisPipeline:
         helmet_model_path: str = "ml/weights/helmet_yolov8.pt",
         confidence_threshold: float = 0.35,
         evidence_dir: str = "evidence",
-        device: Optional[str] = None
+        device: Optional[str] = None,
+        helmet_confidence: float = 0.50,
     ):
         self.evidence_generator = EvidenceGenerator(base_dir=evidence_dir)
         self.vehicle_detector = VehicleDetector(
@@ -38,10 +67,24 @@ class TrafficAnalysisPipeline:
         )
         self.helmet_detector = HelmetDetector(
             weights_path=helmet_model_path,
-            device=device
+            device=self.vehicle_detector.device,
+            confidence_threshold=helmet_confidence,
         )
         self.rider_associator = RiderAssociator()
         self.evidence_dir = evidence_dir
+
+    def _helmet_results(self, image, motorcycles, persons, excluded=()):
+        riders = [rider for moto in motorcycles for rider in moto["associated_riders"]
+                  if rider["person_tracking_id"] not in excluded]
+        results = self.helmet_detector.analyze_heads(
+            image, [rider["head_box"] for rider in riders], [person["head_box"] for person in persons]
+        )
+        return {rider["person_tracking_id"]: result for rider, result in zip(riders, results, strict=True)}
+
+    @staticmethod
+    def _combined_crop(motorcycle, rider):
+        bike, person = motorcycle["bounding_box"], rider["person_box"]
+        return {key: (min if key.endswith("1") else max)(bike[key], person[key]) for key in bike}
 
     def get_model_status(self) -> Dict[str, Any]:
         """Returns hardware device, loaded detection models, and helmet status."""
@@ -51,7 +94,7 @@ class TrafficAnalysisPipeline:
             "vehicle_detector": v_status,
             "helmet_detector": h_status,
             "hardware_device": v_status.get("device", "cpu"),
-            "pipeline_operational": True
+            "pipeline_operational": v_status["is_loaded"]
         }
 
     def analyze_image(
@@ -92,6 +135,7 @@ class TrafficAnalysisPipeline:
 
         # 3. Associate riders
         motorcycles, persons = self.rider_associator.associate_riders(raw_detections, (h, w))
+        helmet_results = self._helmet_results(image, motorcycles, persons) if enabled_violations.get("no_helmet", True) else {}
 
         violations: List[Dict[str, Any]] = []
 
@@ -102,7 +146,7 @@ class TrafficAnalysisPipeline:
 
             # Multiple riders check
             if enabled_violations.get("multiple_riders", True) and len(riders) > passenger_limit:
-                v_id = f"VIOL-{uuid.uuid4().hex[:8].upper()}"
+                v_id = f"VIOL-{uuid.uuid4().hex.upper()}"
                 explanation = (
                     f"Motorcycle carrying {len(riders)} occupants, exceeding permitted limit of {passenger_limit}."
                 )
@@ -123,6 +167,7 @@ class TrafficAnalysisPipeline:
                     "tracking_id": moto_track_id,
                     "violation_type": "multiple_riders",
                     "timestamp": 0.0,
+                    "frame_number": 0,
                     "detection_confidence": moto.get("confidence", 0.85),
                     "violation_confidence": 0.90,
                     "evidence_path": evidence_paths["evidence_path"],
@@ -135,13 +180,13 @@ class TrafficAnalysisPipeline:
             # Helmet check on each rider
             if enabled_violations.get("no_helmet", True):
                 for rider in riders:
-                    h_res = self.helmet_detector.analyze_head_region(image, rider["head_box"])
+                    h_res = helmet_results[rider["person_tracking_id"]]
                     rider["helmet_status"] = h_res["status"]
                     rider["helmet_confidence"] = h_res["confidence"]
 
                     # Only flag violation if explicitly classified as no_helmet with sufficient confidence
                     if h_res["status"] == "no_helmet" and h_res["confidence"] >= self.helmet_detector.confidence_threshold:
-                        v_id = f"VIOL-{uuid.uuid4().hex[:8].upper()}"
+                        v_id = f"VIOL-{uuid.uuid4().hex.upper()}"
                         r_track = rider.get("person_tracking_id", moto_track_id)
                         explanation = (
                             f"Motorcycle rider (Track #{r_track}) classified as NO HELMET with confidence {h_res['confidence']:.2f}."
@@ -153,7 +198,7 @@ class TrafficAnalysisPipeline:
                                 image, raw_detections, [{"violation_type": "no_helmet", "tracking_id": r_track}],
                                 frame_idx=0, timestamp=0.0, camera_id=cam_id
                             ),
-                            crop_box=rider["person_box"]
+                            crop_box=self._combined_crop(moto, rider)
                         )
 
                         violations.append({
@@ -163,6 +208,8 @@ class TrafficAnalysisPipeline:
                             "tracking_id": r_track,
                             "violation_type": "no_helmet",
                             "timestamp": 0.0,
+                            "frame_number": 0,
+                            "motorcycle_tracking_id": moto_track_id,
                             "detection_confidence": rider.get("person_confidence", 0.85),
                             "violation_confidence": h_res["confidence"],
                             "evidence_path": evidence_paths["evidence_path"],
@@ -201,8 +248,16 @@ class TrafficAnalysisPipeline:
         video_path: str,
         camera_config: Dict[str, Any],
         job_id: str,
-        progress_callback: Optional[Callable[[float, int, int], None]] = None
+        progress_callback: Optional[Callable[[float, int, int], None]] = None,
+        incident_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        write_annotated_video: bool = True,
     ) -> Dict[str, Any]:
+        with ExitStack() as resources:
+            return self._analyze_video(video_path, camera_config, job_id, progress_callback, incident_callback,
+                                       write_annotated_video, resources)
+
+    def _analyze_video(self, video_path, camera_config, job_id, progress_callback, incident_callback,
+                       write_annotated_video, resources):
         """
         Processes video stream frame-by-frame:
         1. Object detection & multi-object tracking across frames.
@@ -216,13 +271,14 @@ class TrafficAnalysisPipeline:
             raise FileNotFoundError(f"Video not found at {video_path}")
 
         cap = cv2.VideoCapture(video_path)
+        resources.callback(cap.release)
         if not cap.isOpened():
             raise ValueError(f"Could not open video file at {video_path}")
 
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
-        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1280
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 720
+        reported_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        total_frames = int(reported_count) if math.isfinite(reported_count) and reported_count > 0 else 0
+        reported_fps = cap.get(cv2.CAP_PROP_FPS)
+        fps = reported_fps if math.isfinite(reported_fps) and reported_fps > 0 else 25.0
 
         cam_id = camera_config.get("id", "CAM-01")
         passenger_limit = camera_config.get("passenger_limit", 2)
@@ -237,43 +293,67 @@ class TrafficAnalysisPipeline:
         tracker = MultiObjectTracker(iou_threshold=0.25, max_age=15)
         passenger_counter = PassengerCounter(buffer_size=5, min_consecutive_frames=3)
         wrong_way_detector = WrongWayDetector(min_movement_pixels=25.0, consecutive_frames_required=3)
-        alerted_helmet_tracks = set()
+        helmet_observations = HelmetObservations()
 
         # Video writer for annotated output
-        annotated_video_path = os.path.join(self.evidence_generator.video_dir, f"{job_id}_annotated.mp4")
-        # Try mp4v or avc1
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out_writer = cv2.VideoWriter(annotated_video_path, fourcc, fps, (width, height))
+        annotated_video_path = None
+        out_writer = None
 
-        all_detections: List[Dict[str, Any]] = []
+        detections_count = 0
         violations: List[Dict[str, Any]] = []
-        unique_vehicle_ids = set()
+        previous_vehicles = set()
+        unique_vehicles = 0
 
         frame_idx = 0
-        start_time = time.time()
+        start_time = time.perf_counter()
+        inference_seconds = 0.0
+        previous_timestamp = -1.0 / fps
 
         while True:
             ret, frame = cap.read()
             if not ret or frame is None:
                 break
+            height, width = frame.shape[:2]
+            if write_annotated_video and out_writer is None:
+                annotated_video_path = os.path.join(self.evidence_generator.video_dir, f"{job_id}_annotated.mp4")
+                out_writer = cv2.VideoWriter(annotated_video_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
+                resources.callback(out_writer.release)
+                if not out_writer.isOpened():
+                    raise RuntimeError("Could not initialize the annotated video encoder")
 
-            timestamp = frame_idx / fps
+            decoded_timestamp = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+            timestamp = (
+                decoded_timestamp if math.isfinite(decoded_timestamp) and decoded_timestamp >= 0
+                and decoded_timestamp > previous_timestamp else previous_timestamp + 1.0 / fps
+            )
+            previous_timestamp = timestamp
 
             # 1. Detection
+            inference_start = time.perf_counter()
             raw_dets = self.vehicle_detector.detect(frame, frame_number=frame_idx, timestamp=timestamp)
+            inference_seconds += time.perf_counter() - inference_start
 
             # 2. Tracking
             tracked_dets = tracker.update(raw_dets)
-            all_detections.extend(tracked_dets)
-
-            for d in tracked_dets:
-                if d.get("tracking_id"):
-                    unique_vehicle_ids.add(d["tracking_id"])
+            detections_count += len(tracked_dets)
+            active_ids = {track.track_id for track in tracker.tracks}
+            active_vehicles = {track.track_id for track in tracker.tracks if track.object_class != "person"}
+            unique_vehicles += len(active_vehicles - previous_vehicles)
+            previous_vehicles = active_vehicles
+            helmet_observations.prune(active_ids)
+            for state in (passenger_counter.count_history, wrong_way_detector.consecutive_wrong_way_counts):
+                for expired in state.keys() - active_ids:
+                    del state[expired]
+            passenger_counter.reported_tracks.intersection_update(active_ids)
+            wrong_way_detector.reported_tracks.intersection_update(active_ids)
 
             active_frame_violations = []
 
             # 3. Rider Association
             motorcycles, persons = self.rider_associator.associate_riders(tracked_dets, (height, width))
+            inference_start = time.perf_counter()
+            helmet_results = self._helmet_results(frame, motorcycles, persons, helmet_observations.reported) if enabled_violations.get("no_helmet", True) else {}
+            inference_seconds += time.perf_counter() - inference_start
 
             # 4. Check Multiple Riders & Helmet violations
             for moto in motorcycles:
@@ -284,7 +364,7 @@ class TrafficAnalysisPipeline:
                 if enabled_violations.get("multiple_riders", True):
                     p_viol = passenger_counter.update(m_track_id, riders, passenger_limit=passenger_limit)
                     if p_viol:
-                        v_id = f"VIOL-{uuid.uuid4().hex[:8].upper()}"
+                        v_id = f"VIOL-{uuid.uuid4().hex.upper()}"
                         annot_frame = self.evidence_generator.draw_annotations(
                             frame, tracked_dets, [p_viol], frame_idx=frame_idx, timestamp=timestamp, camera_id=cam_id
                         )
@@ -301,6 +381,7 @@ class TrafficAnalysisPipeline:
                             "tracking_id": m_track_id,
                             "violation_type": "multiple_riders",
                             "timestamp": round(timestamp, 2),
+                            "frame_number": frame_idx,
                             "detection_confidence": moto.get("confidence", 0.85),
                             "violation_confidence": p_viol.get("confidence", 0.90),
                             "evidence_path": paths["evidence_path"],
@@ -315,49 +396,39 @@ class TrafficAnalysisPipeline:
                 # Helmet check
                 if enabled_violations.get("no_helmet", True):
                     for rider in riders:
-                        h_res = self.helmet_detector.analyze_head_region(frame, rider["head_box"])
                         r_track = rider.get("person_tracking_id", m_track_id)
-                        if h_res["status"] == "no_helmet" and h_res["confidence"] >= self.helmet_detector.confidence_threshold:
-                            if r_track not in alerted_helmet_tracks:
-                                alerted_helmet_tracks.add(r_track)
-                                v_id = f"VIOL-{uuid.uuid4().hex[:8].upper()}"
-                                annot_frame = self.evidence_generator.draw_annotations(
-                                    frame, tracked_dets, [{"violation_type": "no_helmet", "tracking_id": r_track}],
-                                    frame_idx=frame_idx, timestamp=timestamp, camera_id=cam_id
-                                )
-                                paths = self.evidence_generator.save_evidence(
-                                    violation_id=v_id,
-                                    original_frame=frame,
-                                    annotated_frame=annot_frame,
-                                    crop_box=rider["person_box"]
-                                )
-                                viol_record = {
-                                    "violation_id": v_id,
-                                    "job_id": job_id,
-                                    "camera_id": cam_id,
-                                    "tracking_id": r_track,
-                                    "violation_type": "no_helmet",
-                                    "timestamp": round(timestamp, 2),
-                                    "detection_confidence": rider.get("person_confidence", 0.85),
-                                    "violation_confidence": h_res["confidence"],
-                                    "evidence_path": paths["evidence_path"],
-                                    "annotated_evidence_path": paths["annotated_evidence_path"],
-                                    "crop_path": paths["crop_path"],
-                                    "explanation": f"Rider on Track #{m_track_id} detected without helmet with confidence {h_res['confidence']:.2f}.",
-                                    "review_status": "pending"
-                                }
-                                violations.append(viol_record)
-                                active_frame_violations.append(viol_record)
+                        h_res = helmet_results.get(r_track)
+                        if not h_res or not helmet_observations.observe(r_track, m_track_id, frame_idx, timestamp, h_res["status"]):
+                            continue
+                        v_id = f"VIOL-{uuid.uuid4().hex.upper()}"
+                        annot_frame = self.evidence_generator.draw_annotations(
+                            frame, tracked_dets, [{"violation_type": "no_helmet", "tracking_id": r_track}],
+                            frame_idx=frame_idx, timestamp=timestamp, camera_id=cam_id
+                        )
+                        paths = self.evidence_generator.save_evidence(
+                            violation_id=v_id, original_frame=frame, annotated_frame=annot_frame,
+                            crop_box=self._combined_crop(moto, rider),
+                        )
+                        viol_record = {
+                            "violation_id": v_id, "job_id": job_id, "camera_id": cam_id, "tracking_id": r_track,
+                            "violation_type": "no_helmet", "timestamp": timestamp, "frame_number": frame_idx,
+                            "motorcycle_tracking_id": m_track_id, "detection_confidence": rider["person_confidence"],
+                            "violation_confidence": h_res["confidence"], **paths,
+                            "explanation": f"Three consecutive no-helmet observations on motorcycle track #{m_track_id}.",
+                            "review_status": "pending",
+                        }
+                        violations.append(viol_record)
+                        active_frame_violations.append(viol_record)
 
             # 5. Wrong-Way Driving Analysis
             if enabled_violations.get("wrong_way", True):
                 for track in tracker.tracks:
                     # Exclude pedestrians from wrong-way driving rules
-                    if track.object_class == "person":
+                    if track.object_class == "person" or track.time_since_update:
                         continue
                     ww_viol = wrong_way_detector.evaluate_track(track, expected_dir)
                     if ww_viol:
-                        v_id = f"VIOL-{uuid.uuid4().hex[:8].upper()}"
+                        v_id = f"VIOL-{uuid.uuid4().hex.upper()}"
                         annot_frame = self.evidence_generator.draw_annotations(
                             frame, tracked_dets, [ww_viol], frame_idx=frame_idx, timestamp=timestamp, camera_id=cam_id
                         )
@@ -379,6 +450,7 @@ class TrafficAnalysisPipeline:
                             "tracking_id": track.track_id,
                             "violation_type": "wrong_way",
                             "timestamp": round(timestamp, 2),
+                            "frame_number": frame_idx,
                             "detection_confidence": track.confidence,
                             "violation_confidence": ww_viol["confidence"],
                             "evidence_path": paths["evidence_path"],
@@ -390,37 +462,41 @@ class TrafficAnalysisPipeline:
                         violations.append(viol_record)
                         active_frame_violations.append(viol_record)
 
-            # Render HUD and write frame to annotated video
-            annotated_frame = self.evidence_generator.draw_annotations(
-                frame, tracked_dets, active_frame_violations,
-                frame_idx=frame_idx, timestamp=timestamp, camera_id=cam_id
-            )
-            out_writer.write(annotated_frame)
+            if incident_callback:
+                for incident in active_frame_violations:
+                    incident_callback(incident)
+            if out_writer is not None:
+                out_writer.write(self.evidence_generator.draw_annotations(
+                    frame, tracked_dets, active_frame_violations, frame_idx=frame_idx, timestamp=timestamp, camera_id=cam_id
+                ))
 
             frame_idx += 1
             if progress_callback and (frame_idx % 5 == 0 or frame_idx == total_frames):
-                pct = round(min(100.0, (frame_idx / total_frames) * 100.0), 1)
+                pct = round(min(100.0, (frame_idx / max(1, total_frames)) * 100.0), 1) if total_frames else 0.0
                 progress_callback(pct, frame_idx, total_frames)
 
-        cap.release()
-        out_writer.release()
+        if not frame_idx or (total_frames and frame_idx < total_frames - max(2, int(total_frames * 0.02))):
+            raise ValueError("Video is empty or ended before the expected frame count")
+        if progress_callback:
+            progress_callback(100.0, frame_idx, max(frame_idx, total_frames))
 
-        elapsed = time.time() - start_time
+        elapsed = time.perf_counter() - start_time
         fps_achieved = round(frame_idx / max(1e-5, elapsed), 2)
         logger.info(f"Processed {frame_idx} video frames in {elapsed:.2f}s ({fps_achieved} FPS)")
 
         return {
             "job_id": job_id,
             "media_type": "video",
-            "total_frames": total_frames,
+            "total_frames": max(frame_idx, total_frames),
             "processed_frames": frame_idx,
             "processing_fps": fps_achieved,
+            "mean_inference_ms": round(1000 * inference_seconds / frame_idx, 2),
             "annotated_video_path": annotated_video_path,
-            "detections_count": len(all_detections),
-            "unique_vehicles": len(unique_vehicle_ids),
+            "detections_count": detections_count,
+            "unique_vehicles": unique_vehicles,
             "violations": violations,
             "summary": {
-                "total_vehicles_detected": len(unique_vehicle_ids),
+                "total_vehicles_detected": unique_vehicles,
                 "violations_count": len(violations),
                 "no_helmet_count": sum(1 for v in violations if v["violation_type"] == "no_helmet"),
                 "multiple_riders_count": sum(1 for v in violations if v["violation_type"] == "multiple_riders"),

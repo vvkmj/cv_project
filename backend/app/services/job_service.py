@@ -2,6 +2,7 @@ import os
 import time
 from datetime import datetime
 import logging
+from threading import Lock
 from typing import Dict, Any, Optional
 from sqlalchemy.orm import Session
 
@@ -17,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 # Reusable pipeline instance
 _pipeline: Optional[TrafficAnalysisPipeline] = None
+_inference_lock = Lock()
 
 def get_pipeline() -> TrafficAnalysisPipeline:
     global _pipeline
@@ -25,6 +27,7 @@ def get_pipeline() -> TrafficAnalysisPipeline:
             vehicle_model_path=settings.VEHICLE_MODEL_PATH,
             helmet_model_path=settings.HELMET_MODEL_PATH,
             confidence_threshold=settings.DETECTION_CONFIDENCE,
+            helmet_confidence=settings.HELMET_CONFIDENCE,
             evidence_dir=settings.EVIDENCE_DIR
         )
     return _pipeline
@@ -52,8 +55,8 @@ def process_image_job(job_id: str, file_path: str, camera_id: str):
             "enabled_violations": camera.enabled_violations if camera else {"no_helmet": True, "multiple_riders": True, "wrong_way": False}
         }
 
-        pipeline = get_pipeline()
-        result = pipeline.analyze_image(file_path, camera_config, job_id)
+        with _inference_lock:
+            result = get_pipeline().analyze_image(file_path, camera_config, job_id)
 
         # Persist violations
         for v in result.get("violations", []):
@@ -103,7 +106,7 @@ def process_image_job(job_id: str, file_path: str, camera_id: str):
         job = db.query(AnalysisJob).filter(AnalysisJob.id == job_id).first()
         if job:
             job.status = "failed"
-            job.error_message = str(e)
+            job.error_message = "Image analysis failed. Check the input and detector configuration."
             job.completed_at = datetime.utcnow()
             db.commit()
     finally:
@@ -131,8 +134,6 @@ def process_video_job(job_id: str, file_path: str, camera_id: str):
             "enabled_violations": camera.enabled_violations if camera else {"no_helmet": True, "multiple_riders": True, "wrong_way": True}
         }
 
-        pipeline = get_pipeline()
-
         def progress_callback(pct: float, current_frame: int, total_frames: int):
             try:
                 # Open isolated session for progress update to avoid long locks
@@ -147,7 +148,8 @@ def process_video_job(job_id: str, file_path: str, camera_id: str):
             except Exception as pe:
                 logger.debug(f"Progress update warning: {pe}")
 
-        result = pipeline.analyze_video(file_path, camera_config, job_id, progress_callback=progress_callback)
+        with _inference_lock:
+            result = get_pipeline().analyze_video(file_path, camera_config, job_id, progress_callback=progress_callback)
 
         # Refresh job
         job = db.query(AnalysisJob).filter(AnalysisJob.id == job_id).first()
@@ -187,7 +189,7 @@ def process_video_job(job_id: str, file_path: str, camera_id: str):
         job = db.query(AnalysisJob).filter(AnalysisJob.id == job_id).first()
         if job:
             job.status = "failed"
-            job.error_message = str(e)
+            job.error_message = "Video analysis failed. Check the input and detector configuration."
             job.completed_at = datetime.utcnow()
             db.commit()
     finally:

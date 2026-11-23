@@ -7,7 +7,7 @@ services:
       dockerfile: backend/Dockerfile
     container_name: traffic_backend
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     volumes:
       - ./evidence:/app/evidence
       - ./uploads:/app/uploads
@@ -17,7 +17,7 @@ services:
     environment:
       - DATABASE_URL=sqlite:///./traffic_system.db
       - DETECTION_CONFIDENCE=0.35
-      - HELMET_CONFIDENCE=0.65
+      - HELMET_CONFIDENCE=0.50
       - DEFAULT_PASSENGER_LIMIT=2
     restart: unless-stopped
 
@@ -27,7 +27,7 @@ services:
       dockerfile: Dockerfile
     container_name: traffic_frontend
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     depends_on:
       - backend
     restart: unless-stopped
